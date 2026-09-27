@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- TrollStore 安装时会用它自己的签名覆盖这些，这里只是为了
+	     让 ad-hoc 签名本身合法、bundle 结构完整。
+
+	     刻意不加 platform-application：那是给需要跳出沙盒的工具用的，
+	     一个相册 App 不需要，加了反而可能引入权限问题。 -->
+	<key>application-identifier</key>
+	<string>com.yuan.slideshow</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>TROLLSTORE</string>
+	<key>get-task-allow</key>
+	<true/>
+</dict>
+</plist>

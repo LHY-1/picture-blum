@@ -1,0 +1,17 @@
+# 本机/隐私
+/.claude
+/install_xcode14.sh
+
+# macOS
+.DS_Store
+
+# 构建产物（每次 build 重新生成）
+SlideShow/build/
+SlideShow/build-sim/
+SlideShow/*.app/
+
+# build_ipa.sh 自动递增的计数文件，每个克隆各自跑
+SlideShow/build_number.txt
+
+# 本地照片库（如果有从 App 拷回来的）
+SlideShow/Documents/
