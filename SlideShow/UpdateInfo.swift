@@ -157,7 +157,9 @@ final class UpdateChecker: ObservableObject {
             .urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Update", isDirectory: true)
         try? FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
-        let dest = destDir.appendingPathComponent("SlideShow-\(manifest.version).ipa")
+        // 文件名跟着 manifest.url 走（新发布是 .zip 包，老版本可能直接是 .ipa）
+        let remoteName = URL(string: manifest.url)?.lastPathComponent ?? "SlideShow.zip"
+        let dest = destDir.appendingPathComponent(remoteName)
 
         var request = URLRequest(url: URL(string: manifest.url)!)
         request.timeoutInterval = 120
@@ -179,14 +181,54 @@ final class UpdateChecker: ObservableObject {
                 self.downloadedIPA = dest
                 UserDefaults.standard.set(dest.absoluteString, forKey: Keys.downloadedIPA)
 
-                // 校验不过不装，退回手动兜底
+                // 校验不过不装，退回手动兜底（manifest.sha256 对应下载文件的哈希）
                 guard Self.verify(dest, expectedSHA256: manifest.sha256) else {
                     self.checkError = "校验失败：SHA256 不匹配，请检查发布端或网络，已退回手动安装。"
                     return
                 }
-                self.attemptInstall(dest)
+
+                // GitHub 只能上传 .zip：解压出里面固定的 SlideShow.ipa 再装
+                let installPath: URL
+                if dest.path.lowercased().hasSuffix(".zip") {
+                    guard let ipa = Self.unzipIPA(in: dest) else {
+                        self.checkError = "解压失败，请手动安装（包已下载好，文件 App 里可解压）。"
+                        return
+                    }
+                    installPath = ipa
+                } else {
+                    installPath = dest
+                }
+                self.downloadedIPA = installPath
+                UserDefaults.standard.set(installPath.absoluteString, forKey: Keys.downloadedIPA)
+
+                self.attemptInstall(installPath)
             }
         }.resume()
+    }
+
+    /// 解压 zip，取根目录下的 .ipa（发布端规定：zip 里只装 SlideShow.ipa）
+    private static func unzipIPA(in zipFile: URL) -> URL? {
+        let tmpDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ss-unzip-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        let ok = unzipArchive(zipFile.path, to: tmpDir.path)
+        var ipa: URL?
+        if ok {
+            let found = (try? FileManager.default
+                .contentsOfDirectory(at: tmpDir, includingPropertiesForKeys: nil))?
+                .filter { $0.pathExtension.lowercased() == "ipa" }
+            ipa = found?.first
+        }
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        guard let ipa else { return nil }
+        let dest = FileManager.default
+            .urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Update/SlideShow.ipa")
+        do {
+            try FileManager.default.removeItem(at: dest)
+            try FileManager.default.copyItem(at: ipa, to: dest)
+            return dest
+        } catch { return nil }
     }
 
     /// 重新装一次已下载的包（TSServer 没接上时的手动重试入口）
@@ -205,13 +247,32 @@ final class UpdateChecker: ObservableObject {
     // MARK: 安装（XPC）
 
     /// 新 SDK 没有 XPC 模块（符号还在 /usr/lib/libXPC.dylib 里，
-    /// 只是没给 Swift 头声明），用 dlsym 取运行时函数地址。
+    /// 只是没给 Swift 头声明），用 @_silgen_name 直接声明 C 函数
+    /// （libSystem 已链接，编译期可解析；之前的链接错误只来自
+    /// NSUnzipArchiveFile，ZIPArchive framework 没链，下面改走运行时 dlsym）。
 
     @_silgen_name("dlopen")
-    private func dlopen(_ filename: UnsafePointer<CChar>?, _ flags: Int32) -> OpaquePointer?
+    private static func dlopenC(_ filename: UnsafePointer<CChar>?,
+                                _ flags: Int32) -> OpaquePointer?
 
     @_silgen_name("dlsym")
-    private func dlsym(_ handle: OpaquePointer?, _ symbol: UnsafePointer<CChar>) -> OpaquePointer?
+    private static func dlsymC(_ handle: OpaquePointer?,
+                               _ symbol: UnsafePointer<CChar>?) -> OpaquePointer?
+
+    /// iOS 没有公开的 zip 解压 API，系统私有框架 ZIPArchive 里有，
+    /// 但 SDK 没带它的头（链接不过），运行时 dlopen + dlsym 解析。
+    /// 解析不到返回 false，退回手动安装。
+    private static func unzipArchive(_ zipPath: String, to destDir: String) -> Bool {
+        let fwPath = "/System/Library/Frameworks/ZIPArchive.framework/ZIPArchive"
+        guard let handle = fwPath.withCString { dlopenC($0, 0x06) },  // RTLD_LAZY|NOW
+              let sym = dlsymC(handle, "NSUnzipArchiveFile")
+        else { return false }
+        let f = unsafeBitCast(sym, to: ((UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32).self)
+        let result = zipPath.withCString { z in
+            destDir.withCString { d in f(z, d) }
+        }
+        return result == 0
+    }
 
     /// void (XPCConnectionDelegateRef delegate, XPCConnectionEvent event, void *arg)
     /// 连接事件是位掩码，4 = invalidated
@@ -235,8 +296,9 @@ final class UpdateChecker: ObservableObject {
 
     /// 取 libXPC.dylib 里的符号；缺就返回 nil，整个安装退回手动模式
     private func xpcSymbol(_ name: String) -> OpaquePointer? {
-        guard let handle = dlopen("/usr/lib/libXPC.dylib", 2) else { return nil }  // RTLD_NOW
-        return dlsym(handle, name)
+        let path = "/usr/lib/libXPC.dylib"
+        guard let handle = path.withCString({ Self.dlopenC($0, 2) }) else { return nil }  // RTLD_NOW
+        return name.withCString { Self.dlsymC(handle, $0) }
     }
 
     /// 调 TrollStore 的系统级安装服务（TSServer XPC）。
