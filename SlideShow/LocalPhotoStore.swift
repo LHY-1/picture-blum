@@ -128,7 +128,7 @@ final class LocalPhotoStore: ObservableObject {
 
     // MARK: - 扫描
 
-    /// 重新扫描两个目录。会顺手收编 Documents 根目录下的散图
+    /// 重新扫收件箱。会顺手收编 Documents 根目录下的散图
     /// （用「文件」App 或 Finder 拖进来的照片会落在那里）。
     func refresh() {
         ioQueue.async { [weak self] in
@@ -136,24 +136,23 @@ final class LocalPhotoStore: ObservableObject {
 
             self.adoptLooseFiles()
 
-            let inbox = self.scan(self.inboxDir)
-            let media = self.scan(self.mediaDir)
+            let inbox = self.scanDir(self.inboxDir)
 
             DispatchQueue.main.async {
-                self.apply(inbox: inbox, media: media)
+                self.apply(inbox: inbox)
             }
         }
     }
 
-    /// 只在主线程调用。媒体库真的变了才广播，避免无谓的重载。
-    private func apply(inbox: [URL], media: [URL]) {
-        let signature = media.map { $0.lastPathComponent }.joined(separator: "|")
+    /// 只在主线程调用。真的有变化才广播，避免无谓的重载。
+    private func apply(inbox: [URL]) {
+        let sig = "inbox:" + inbox.map { $0.lastPathComponent }
+            .joined(separator: "|") + "||entries:" + entriesSignature()
         let isFirstScan = !hasScannedOnce
-        let changed = signature != mediaSignature
+        let changed = sig != signature
 
         self.inbox = inbox
-        self.media = media
-        mediaSignature = signature
+        signature = sig
         hasScannedOnce = true
 
         // 首次扫描不广播 —— 启动流程自己会加载一遍
@@ -161,7 +160,12 @@ final class LocalPhotoStore: ObservableObject {
         NotificationCenter.default.post(name: .photoStoreDidChange, object: nil)
     }
 
-    private func scan(_ dir: URL) -> [URL] {
+    private func entriesSignature() -> String {
+        entries.map { "\($0.name)|\($0.assetID ?? "-")" }
+            .joined(separator: "|")
+    }
+
+    private func scanDir(_ dir: URL) -> [URL] {
         let keys: [URLResourceKey] = [.isRegularFileKey, .creationDateKey]
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: dir, includingPropertiesForKeys: keys,
@@ -182,101 +186,303 @@ final class LocalPhotoStore: ObservableObject {
     /// Documents 根目录下的散图 → 收件箱
     private func adoptLooseFiles() {
         let docs = root.deletingLastPathComponent()
-        guard let entries = try? FileManager.default.contentsOfDirectory(
+        guard let loose = try? FileManager.default.contentsOfDirectory(
             at: docs, includingPropertiesForKeys: [.isRegularFileKey],
             options: [.skipsHiddenFiles]
         ) else { return }
 
-        for url in entries
+        for url in loose
         where Self.imageExtensions.contains(url.pathExtension.lowercased()) {
             let dest = uniqueURL(in: inboxDir, preferredName: url.lastPathComponent)
             try? FileManager.default.moveItem(at: url, to: dest)
         }
     }
 
-    // MARK: - 写入
+    // MARK: - 写入（进系统相册）
 
-    /// 保存一个上传。返回落盘后的 URL。
+    /// 保存一个上传。大图直接写进系统相册，本地只留小缩略图 + 登记。
     /// 可能被后台网络线程调用，内部自己切队列。
     ///
     /// importImmediately 由调用方在主线程读好再传进来 —— autoImport 是
     /// @Published，不能在后台队列上读。
+    /// 返回 1 = 成功（进了相册或进了收件箱），0 = 失败。
     @discardableResult
     func saveUpload(filename: String,
-                    data: Data,
-                    importImmediately: Bool) -> URL? {
+                   data: Data,
+                   importImmediately: Bool) -> Int {
         let safeName = Self.sanitize(filename)
         let ext = (safeName as NSString).pathExtension.lowercased()
 
-        guard Self.imageExtensions.contains(ext) else { return nil }
-        guard !data.isEmpty else { return nil }
+        guard Self.imageExtensions.contains(ext) else { return 0 }
+        guard !data.isEmpty else { return 0 }
 
-        var result: URL?
-        ioQueue.sync {
-            let staged = uniqueURL(in: inboxDir, preferredName: safeName)
-            do {
-                try data.write(to: staged, options: .atomic)
-            } catch {
-                return
-            }
-
-            makeThumbnail(for: staged)
-
-            result = importImmediately ? moveToMedia(staged) : staged
+        // 1. 大图写进系统相册（「添加照片」权限，不动已有内容）。
+        // 用 PHAssetCreationRequest 直接塞数据资源，不解码原图
+        // （iPad Air 2 上整图解码一张大图太费内存）。
+        var didAddToAlbum = false
+        PHPhotoLibrary.shared().performChanges {
+            let creation = PHAssetCreationRequest.forAsset()
+            let resOptions = PHAssetResourceCreationOptions()
+            resOptions.originalFilename = safeName
+            // data 版（不解码原图）：直接塞原始字节
+            _ = creation.addResource(with: .photo, data: data,
+                                      options: resOptions)
+            didAddToAlbum = creation.placeholderForCreatedAsset != nil
         }
 
+        // 2. 本地留小缩略图（网页和网格用）。
+        //    写进临时文件再解码，不占 Documents
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("thumb-\(UUID().uuidString)")
+        do {
+            try data.write(to: tmp)
+        } catch {
+            return 0
+        }
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        ioQueue.sync {
+            if importImmediately, didAddToAlbum {
+                addEntry(name: safeName, bytes: data.count)
+            }
+            _ = makeThumbnailForName(safeName, sourceURL: tmp)
+        }
+        persistEntries()
+
         refresh()
-        return result
+        return 1
     }
 
-    /// 把收件箱里的照片移进媒体库
+    private func addEntry(name: String, bytes: Int) {
+        // 同名不重复登记
+        if entries.contains(where: { $0.name == name }) { return }
+        entries.append(MediaEntry(name: name, assetID: nil, bytes: bytes))
+    }
+
+    /// 回填 assetID：把登记表里还没记录 id 的照片，
+    /// 到系统相册里按资源文件名找出来。
+    func resolveAssetIDs() {
+        guard entries.contains(where: { $0.assetID == nil }) else { return }
+
+        ioQueue.async { [weak self] in
+            guard let self = self else { return }
+
+            let missing = self.entries.filter { $0.assetID == nil }
+            guard !missing.isEmpty else { return }
+            let names = Set(missing.map { $0.name })
+
+            // 近 3 天 + 资源文件名比对（KVC "filename" 键在 14.8 上
+            // 对导入图查不出来，用公开 API 的 originalFilename）
+            let options = PHFetchOptions()
+            options.predicate = NSPredicate(
+                format: "creationDate > %@",
+                NSDate(timeIntervalSinceNow: -3 * 86400))
+            let result = PHAsset.fetchAssets(with: .image, options: options)
+
+            var byName: [String: String] = [:]
+            result.enumerateObjects { asset, _, _ in
+                for res in PHAssetResource.assetResources(for: asset)
+                where res.type == .photo {
+                    byName[res.originalFilename] = asset.localIdentifier
+                }
+            }
+
+            var found = false
+            DispatchQueue.main.async {
+                for i in self.entries.indices
+                where self.entries[i].assetID == nil {
+                    if let id = byName[self.entries[i].name] {
+                        self.entries[i].assetID = id
+                        found = true
+                    }
+                }
+                if found {
+                    self.persistEntries()
+                }
+            }
+        }
+    }
+
+    /// 有本地文件就立刻出缩略图（同步）。
+    /// 本地没有的（相册里的）走 generateThumbnailForNameAsync。
+    @discardableResult
+    func makeThumbnailForName(_ name: String,
+                              sourceURL: URL?) -> URL? {
+        guard let sourceURL else { return nil }
+        let dest = thumbnailURLForName(name)
+        if FileManager.default.fileExists(atPath: dest.path) { return dest }
+
+        guard let image = Self.downsample(url: sourceURL, maxDimension: 400),
+              let jpeg = image.jpegData(compressionQuality: 0.8) else { return nil }
+        try? jpeg.write(to: dest, options: .atomic)
+        return dest
+    }
+
+    /// 本地没有大图，缩略图直接从「相册 asset」生成（异步，
+    /// 因为 PHImageManager 没有同步出图的公开 API）
+    func generateThumbnailForNameAsync(_ name: String,
+                                       complete: @escaping (URL?) -> Void) {
+        let stem = (name as NSString).deletingPathExtension
+        let dest = thumbsDir.appendingPathComponent(stem + ".jpg")
+        if FileManager.default.fileExists(atPath: dest.path) {
+            DispatchQueue.main.async { complete(dest) }
+            return
+        }
+
+        // 找相册 asset：近 30 天粗筛 + 资源文件名精确核对
+        //（KVC "filename" 谓词在 14.8 上对导入图查不出来）
+        let options = PHFetchOptions()
+        options.predicate = NSPredicate(
+            format: "creationDate > %@",
+            NSDate(timeIntervalSinceNow: -30 * 86400))
+        let result = PHAsset.fetchAssets(with: .image, options: options)
+
+        var targetAsset: PHAsset?
+        result.enumerateObjects { asset, _, _ in
+            for res in PHAssetResource.assetResources(for: asset) {
+                guard res.type == .photo, res.originalFilename == name
+                else { continue }
+                targetAsset = asset
+            }
+        }
+        guard let asset = targetAsset else {
+            DispatchQueue.main.async { complete(nil) }
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            var jpeg: Data?
+            let opts = PHImageRequestOptions()
+            opts.isNetworkAccessAllowed = true
+            opts.deliveryMode = .fastFormat
+            opts.resizeMode = .fast
+            PHImageManager.default().requestImageData(
+                for: asset,
+                options: opts,
+                resultHandler: { data, _, _, _ in
+                    guard let data else {
+                        DispatchQueue.main.async { complete(nil) }
+                        return
+                    }
+                    // 后台解码成 400px 再压 jpeg
+                    let tmpURL = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("\(UUID().uuidString)")
+                    do {
+                        try data.write(to: tmpURL)
+                        if let img = Self.downsample(url: tmpURL, maxDimension: 400) {
+                            jpeg = img.jpegData(compressionQuality: 0.8)
+                        }
+                        try? FileManager.default.removeItem(at: tmpURL)
+                    } catch {}
+                    DispatchQueue.main.async {
+                        guard let jpeg else {
+                            complete(nil)
+                            return
+                        }
+                        let dest = self.thumbnailURLForName(name)
+                        try? jpeg.write(to: dest, options: .atomic)
+                        self.refresh()
+                        complete(dest)
+                    }
+                })
+        }
+    }
+
+    /// 缩略图路径（按名字）
+    func thumbnailURLForName(_ name: String) -> URL {
+        thumbsDir.appendingPathComponent(
+            (name as NSString).deletingPathExtension + ".jpg")
+    }
+
+    /// 把收件箱里待导入的文件写进系统相册。
+    /// 成功一张删一张本地文件（大图不留在本地），生成缩略图 + 登记。
     @discardableResult
     func importAll() -> Int {
         var count = 0
         ioQueue.sync {
-            for url in scan(inboxDir) {
-                if moveToMedia(url) != nil { count += 1 }
-            }
+            let files = scanDir(inboxDir)
+            count = files.filter { importOneLocked($0) }.count
         }
+        persistEntries()
         refresh()
+        resolveAssetIDs()
         return count
     }
 
     @discardableResult
-    func importOne(_ url: URL) -> URL? {
-        var result: URL?
-        ioQueue.sync { result = moveToMedia(url) }
+    func importOne(_ url: URL) -> Int {
+        var result = 0
+        ioQueue.sync {
+            if importOneLocked(url) { result = 1 }
+        }
+        persistEntries()
         refresh()
+        resolveAssetIDs()
         return result
     }
 
-    /// 只在 ioQueue 内部调用
-    private func moveToMedia(_ url: URL) -> URL? {
-        let dest = uniqueURL(in: mediaDir, preferredName: url.lastPathComponent)
-        do {
-            try FileManager.default.moveItem(at: url, to: dest)
-            return dest
-        } catch {
-            return nil
+    /// 写相册 + 登记 + 生成缩略图 + 删本地文件。
+    /// 调用方必须已在 ioQueue 里。相册写入是同步语义：
+    /// performChanges 主线程调用（HTTP handler 可能跑在后台队列，
+    /// 但 PHPhotoLibrary.performChanges 本身线程安全）。
+    private func importOneLocked(_ url: URL) -> Bool {
+        guard let data = try? Data(contentsOf: url) else { return false }
+        let name = url.lastPathComponent
+
+        var didAdd = false
+        PHPhotoLibrary.shared().performChanges {
+            let creation = PHAssetCreationRequest.forAsset()
+            let resOptions = PHAssetResourceCreationOptions()
+            resOptions.originalFilename = name
+            _ = creation.addResource(with: .photo, data: data,
+                                     options: resOptions)
+            didAdd = creation.placeholderForCreatedAsset != nil
         }
+
+        guard didAdd else { return false }
+
+        addEntry(name: name, bytes: data.count)
+        _ = makeThumbnailForName(name, sourceURL: url)
+        try? FileManager.default.removeItem(at: url)
+        saveEntriesLocked()
+        return true
     }
 
-    func delete(_ urls: [URL]) {
+    /// 删一张（按名字）：清本地缩略图 + 登记；
+    /// 系统相册里的那张留给用户自己删，我们不碰相册里的原图。
+    func delete(named name: String) {
+        ioQueue.sync {
+            try? FileManager.default.removeItem(
+                at: thumbsDir.appendingPathComponent(
+                    (name as NSString).deletingPathExtension + ".jpg"))
+            entries.removeAll { $0.name == name }
+            saveEntriesLocked()
+        }
+        refresh()
+    }
+
+    /// 删收件箱里的文件（还没进相册的）
+    func deleteInbox(_ urls: [URL]) {
         ioQueue.sync {
             for url in urls {
                 try? FileManager.default.removeItem(at: url)
-                try? FileManager.default.removeItem(at: thumbnailURL(for: url))
+                try? FileManager.default.removeItem(
+                    at: thumbnailURL(for: url))
             }
         }
         refresh()
     }
 
-    func deleteAllMedia() {
+    /// 清空本地登记（不删相册里的照片）
+    func deleteAllEntries() {
         ioQueue.sync {
-            for url in scan(mediaDir) {
-                try? FileManager.default.removeItem(at: url)
-                try? FileManager.default.removeItem(at: thumbnailURL(for: url))
+            for e in entries {
+                try? FileManager.default.removeItem(
+                    at: thumbsDir.appendingPathComponent(
+                        (e.name as NSString).deletingPathExtension + ".jpg"))
             }
+            entries.removeAll()
+            saveEntriesLocked()
         }
         refresh()
     }
@@ -286,19 +492,6 @@ final class LocalPhotoStore: ObservableObject {
     /// 缩略图路径（不一定存在）
     func thumbnailURL(for photo: URL) -> URL {
         thumbsDir.appendingPathComponent(photo.lastPathComponent + ".jpg")
-    }
-
-    /// 生成缩略图。已存在则跳过。
-    @discardableResult
-    func makeThumbnail(for photo: URL, maxDimension: CGFloat = 400) -> URL? {
-        let dest = thumbnailURL(for: photo)
-        if FileManager.default.fileExists(atPath: dest.path) { return dest }
-
-        guard let image = Self.downsample(url: photo, maxDimension: maxDimension),
-              let jpeg = image.jpegData(compressionQuality: 0.8) else { return nil }
-
-        try? jpeg.write(to: dest, options: .atomic)
-        return dest
     }
 
     // MARK: - 图片解码
@@ -363,9 +556,7 @@ final class LocalPhotoStore: ObservableObject {
     // MARK: - 统计
 
     var mediaBytes: Int {
-        media.reduce(0) { sum, url in
-            sum + ((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
-        }
+        entries.reduce(0) { $0 + $1.bytes }
     }
 
     static func formatBytes(_ bytes: Int) -> String {

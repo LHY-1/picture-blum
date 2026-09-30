@@ -18,7 +18,7 @@ APP_NAME="SlideShow"
 BUNDLE_ID="com.yuan.slideshow"
 DISPLAY_NAME="相框"
 MIN_IOS="14.0"                  # 改这里也要改 Info.plist 的 MinimumOSVersion
-VERSION="1.8"                   # 语义版本：只有加了真功能才改
+VERSION="1.9"                   # 语义版本：只有加了真功能才改
 
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SRC_DIR/build"

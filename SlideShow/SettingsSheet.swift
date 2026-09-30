@@ -15,6 +15,7 @@ struct SettingsSheet: View {
 
     @ObservedObject private var server = PhotoServer.shared
     @ObservedObject private var store = LocalPhotoStore.shared
+    @StateObject private var checker = UpdateChecker()
     @State private var showServer = false
 
     var body: some View {
@@ -32,6 +33,7 @@ struct SettingsSheet: View {
                 themeSection
                 serverSection
                 otherSection
+                updateSection
                 infoSection
             }
             .navigationTitle("设置")
@@ -61,7 +63,7 @@ struct SettingsSheet: View {
             HStack {
                 Text("上传的照片")
                 Spacer()
-                Text("\(store.media.count) 张")
+                Text("\(store.entries.count) 张")
                     .foregroundColor(.secondary)
             }
         }
@@ -374,6 +376,61 @@ struct SettingsSheet: View {
         }
     }
 
+    // MARK: - 版本更新
+
+    private var updateSection: some View {
+        Section(header: Text("更新")) {
+            // 状态行
+            HStack {
+                Text("当前版本")
+                Spacer()
+                Text(AppInfo.display)
+                    .foregroundColor(.secondary)
+            }
+
+            // 检查按钮：没检过 / 检到有新版 / 上次失败时显示
+            if checker.manifest == nil && checker.downloadedIPA == nil {
+                Button(action: { checker.check() }) {
+                    HStack {
+                        Label("检查更新", systemImage: "arrow.triangle.2.circlepath")
+                            .foregroundColor(.blue)
+                        Spacer()
+                        if checker.isChecking {
+                            ProgressView()
+                        }
+                    }
+                }
+                .disabled(checker.isChecking || checker.isDownloading)
+            }
+
+            // 检到新版 → 下载 / 打开已下载的包
+            if let m = checker.manifest, m.build > UpdateInfo.currentBuild {
+                Button(action: { checker.download() }) {
+                    Label("下载新版本 v\(m.version) (build \(m.build))",
+                          systemImage: "arrow.down.circle")
+                        .foregroundColor(.blue)
+                }
+                .disabled(checker.isDownloading || checker.isChecking)
+
+                if let url = checker.downloadedIPA {
+                    Button(action: { checker.openFilesApp() }) {
+                        Label("在「文件」App 中安装", systemImage: "folder")
+                            .foregroundColor(.orange)
+                    }
+                    Text("装包：在「文件」App 里找到 SlideShow-\(m.version).ipa → 点它 → 用 TrollStore 打开 → Install。装完新 App 起来就能接着播。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            if let err = checker.checkError {
+                Text(err)
+                    .font(.caption)
+                    .foregroundColor(.orange)
+            }
+        }
+    }
+
     // MARK: - 信息
 
     private var infoSection: some View {
@@ -420,9 +477,10 @@ struct SettingsSheet: View {
                 Spacer()
                 Text(viewModel.library.permissionDescription)
                     .foregroundColor(viewModel.library.hasPermissionPublic ? .secondary : .red)
-                // 权限被拒时点一下重新去申请
+                // 用户点一下才重新去申请：force = true，允许即使本次运行
+                // 弹过一次仍再弹（这是唯一的手动入口，不会被打扰）
                 Button(action: {
-                    viewModel.library.requestAuthorization { }
+                    viewModel.library.requestAuthorization(force: true) { }
                 }) {
                     Image(systemName: "arrow.clockwise")
                         .foregroundColor(.blue)

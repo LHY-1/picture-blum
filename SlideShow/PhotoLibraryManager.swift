@@ -74,9 +74,15 @@ enum PhotoSourceMode: Int, CaseIterable, Identifiable {
         }
     }
 
-    /// 需不需要申请相册权限
+    /// 需不需要申请相册权限。
+    /// 上传的照片现在也存系统相册，所以**每种模式都需要相册权限**。
     var needsPhotoPermission: Bool {
-        self != .uploaded
+        return true
+    }
+
+    /// 这个模式只看上传进来的照片（按 manifest 过滤），还是全要。
+    var uploadedOnly: Bool {
+        self == .uploaded
     }
 }
 
@@ -101,6 +107,21 @@ class PhotoLibraryManager: ObservableObject {
     /// 被去掉的重复项清单（诊断用，设置 → 信息 里能看到）
     @Published private(set) var removedDuplicates: [String] = []
 
+    /// 权限检查失败次数 + 最近一次拿到的状态（诊断用）
+    @Published private(set) var permissionFailures = 0
+    @Published private(set) var lastPermissionStatus: PHAuthorizationStatus = .notDetermined
+
+    /// 权限重试定时器：运行中遇到权限失败时保持播放，每 60 秒试一次
+    private var permissionRetryTimer: Timer?
+
+    /// 回前台时如果有重试在跑，立刻试一次
+    private var didBecomeActiveObserver: Any?
+
+    /// 本次运行是否已经弹过系统授权框。
+    /// 上传会频繁触发重载；弹过一次还没授权，就不能再弹，
+    /// 交给 60 秒重试 + 回前台观察等用户手动授权。
+    private var hasPromptedThisSession = false
+
     /// 去重别名：被去掉的 asset id → 留下的代表 id。
     /// 相册勾选时用它把「相册里的副本 id」归一到「目录里的代表 id」，
     /// 否则选了某相册里被去重掉的那份，播放列表里就找不到那张照片。
@@ -123,14 +144,104 @@ class PhotoLibraryManager: ObservableObject {
 
     // MARK: - 授权
 
-    /// 回调一定在主线程执行
-    func requestAuthorization(completion: @escaping () -> Void) {
-        PHPhotoLibrary.requestAuthorization { [weak self] status in
+    /// 授权检查，回调一定在主线程执行。
+    ///
+    /// 老代码直接调老 API `PHPhotoLibrary.requestAuthorization`：它每次都会
+    /// 向系统「申请」授权，App 长时间运行后再被触发（后台上传、相册库
+    /// 变化、reload）时，系统可能重新弹授权框——这是「跑着跑着又冒出来
+    /// 照片权限」的元凶。
+    ///
+    /// 这里改成按级别先查后问，且**已授权绝不重新弹框**：
+    /// 读取端（播图）只需 `.readWrite` 下的「读」级别；写入端（上传进
+    /// 相册）只需 `.addOnly`。用户给过任一级别，状态就稳定不再回退。
+    func requestAuthorization(force: Bool = false,
+                             completion: @escaping () -> Void) {
+        let level = PHAccessLevel.readWrite
+        let status = PHPhotoLibrary.authorizationStatus(for: level)
+        guard status == .notDetermined else {
             DispatchQueue.main.async {
-                self?.authorizationStatus = status
+                self.updateStatus(status)
+                completion()
+            }
+            return
+        }
+
+        guard force || !hasPromptedThisSession else {
+            // 弹过一次还没授权：不再打扰。后台上传触发的重载可能
+            // 隔 1.5 秒又来一次，每次都弹会把用户弹烦——
+            // 交给 60 秒重试 / 回前台 / 设置里的「重新申请」去接。
+            DispatchQueue.main.async {
+                self.updateStatus(status)
+                completion()
+            }
+            return
+        }
+
+        hasPromptedThisSession = true
+        PHPhotoLibrary.requestAuthorization(for: level) { [weak self] s in
+            DispatchQueue.main.async {
+                self?.updateStatus(s)
                 completion()
             }
         }
+    }
+
+    /// 权限失败后的恢复入口：60 秒重试定时器 + 回前台时各调一次。
+    /// 只查不弹——被拒的情况下系统不允许 App 自己再弹。
+    /// 用户去「设置 → 照片」里开了权限，这里就能查到并重载照片。
+    func retryAuthorization() {
+        let level = PHAccessLevel.readWrite
+        let status = PHPhotoLibrary.authorizationStatus(for: level)
+        DispatchQueue.main.async {
+            self.updateStatus(status)
+        }
+        guard status == .authorized || status == .limited else { return }
+        guard !self.isLoading else { return }
+        self.stopPermissionRetry()
+        // 接上了：刷新一遍目录。播放队列没被动过（失败时不清），
+        // 相框从头就没断过，这里只是把新照片并进目录。
+        self.loadAllPhotos(mode: self.sourceMode, completion: nil)
+    }
+
+    private func startPermissionRetry() {
+        guard permissionRetryTimer == nil else { return }
+        let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
+            self?.retryAuthorization()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        permissionRetryTimer = timer
+
+        if didBecomeActiveObserver == nil {
+            didBecomeActiveObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.didBecomeActiveNotification,
+                object: nil, queue: .main
+            ) { [weak self] _ in
+                guard let self = self, self.permissionRetryTimer != nil else { return }
+                self.retryAuthorization()
+            }
+        }
+    }
+
+    private func stopPermissionRetry() {
+        permissionRetryTimer?.invalidate()
+        permissionRetryTimer = nil
+        if let observer = didBecomeActiveObserver {
+            NotificationCenter.default.removeObserver(observer)
+            didBecomeActiveObserver = nil
+        }
+    }
+
+    private func updateStatus(_ status: PHAuthorizationStatus) {
+        authorizationStatus = status
+        lastPermissionStatus = status
+        if status == .authorized || status == .limited {
+            permissionFailures = 0
+            hasPromptedThisSession = false
+        }
+    }
+
+    deinit {
+        stopPermissionRetry()
     }
 
     private var hasPhotoPermission: Bool {
@@ -165,32 +276,22 @@ class PhotoLibraryManager: ObservableObject {
         errorMessage = nil
         isLoading = true
 
-        // 上传的照片是读本地目录，很快，直接在主线程取
-        let localPhotos = localSlidePhotos()
-
-        guard mode.needsPhotoPermission else {
-            photos = localPhotos
-            // 只播上传的照片但还没传过：给明确提示，
-            // 别让界面走「相册权限」那条路（容易误以为要授权）
-            errorMessage = localPhotos.isEmpty
-                ? "还没有上传的照片。开「上传服务」从手机传几张照片进来。"
-                : nil
-            isLoading = false
-            completion?()
-            return
-        }
-
+        // 每种模式都需要相册权限，统一走授权检查
         requestAuthorization { [weak self] in
             guard let self = self else { return }
 
             guard self.hasPhotoPermission else {
-                // 没相册权限，但上传的照片还是能播 —— 不要整体罢工
-                self.photos = localPhotos
-                self.errorMessage = localPhotos.isEmpty
-                    ? "请在系统设置里授予相册访问权限"
-                    : nil
-                self.isLoading = false
-                completion?()
+                // 没相册权限。
+                // 已有照片（播放中途被拒 / addOnly 误报）：保持播放 + 60 秒重试
+                //   权限，不清队列 —— 相框不能因为权限问题整体罢工。
+                // 一张都没有（启动时就被拒）：给明确提示。
+                self.permissionFailures += 1
+                self.startPermissionRetry()
+                if self.photos.isEmpty {
+                    self.errorMessage = "请在系统设置里授予相册访问权限"
+                    self.isLoading = false
+                    completion?()
+                }
                 return
             }
 
@@ -200,6 +301,10 @@ class PhotoLibraryManager: ObservableObject {
                 options.sortDescriptors = [
                     NSSortDescriptor(key: "creationDate", ascending: false)
                 ]
+
+                // 上传的照片按登记表匹配出来的那批 asset
+                let uploadedPhotos = self.localSlidePhotos()
+                let uploadedIDs = Set(uploadedPhotos.map { $0.id })
 
                 let result = PHAsset.fetchAssets(with: .image, options: options)
 
@@ -380,14 +485,30 @@ class PhotoLibraryManager: ObservableObject {
 
                 // 回到主线程再改 @Published 属性
                 DispatchQueue.main.async {
-                    self.photos = mode == .both ? localPhotos + kept : kept
+                    // 按来源模式拼最终列表：
+                    //   上传的 → 只有 manifest 匹配到的
+                    //   相册的 → 全库减掉上传的（避免重复）
+                    //   两者   → 全库，上传的排前面（刚传进来的先看到）
+                    let rest = kept.filter { !uploadedIDs.contains($0.id) }
+                    let finalList: [SlidePhoto]
+                    switch mode {
+                    case .uploaded:
+                        finalList = uploadedPhotos
+                    case .systemAlbum:
+                        finalList = rest
+                    case .both:
+                        finalList = uploadedPhotos + rest
+                    }
+
+                    self.photos = finalList
                     self.albums = albumList
                     self.removedDuplicates = duplicatesLog
                     self.aliasToRep = aliasMap
-                    // 有权限却一张都没有：把真实情况写进提示，
-                    // 别让界面误报成「需要授权」
-                    self.errorMessage = (localPhotos + kept).isEmpty
-                        ? "系统相册里没找到照片（共享相簿也算进去了）。"
+                    // 一张都没有：给真实提示，不误报「需要授权」
+                    self.errorMessage = finalList.isEmpty
+                        ? (mode == .uploaded
+                           ? "还没有上传的照片。开「上传服务」从手机传几张进来。"
+                           : "系统相册里没找到照片（共享相簿也算进去了）。")
                         : nil
                     self.isLoading = false
                     completion?()
@@ -396,13 +517,53 @@ class PhotoLibraryManager: ObservableObject {
         }
     }
 
-    /// 把上传库里的文件转成 SlidePhoto。
-    /// id 前缀 "file:" 与 PHAsset 的 localIdentifier 不会撞车，
-    /// 断点续播存的就是这个 id。
+    /// 把「上传的照片」查出来 —— 它们存在系统相册里，
+    /// 按 manifest 登记的名字匹配。
+    ///
+    /// 匹配用 PHAssetResource.assetResources(for:) 的资源 originalFilename
+    /// （这是正式的公开 API；KVC 的 "filename" 键在 14.8 上
+    /// 对导入图不生效，查出来是空的）。
+    /// 先按「最近 7 天」缩范围，再逐个核对资源名。
     private func localSlidePhotos() -> [SlidePhoto] {
-        localStore.media.map { url in
-            SlidePhoto(id: "file:" + url.lastPathComponent, source: .file(url))
+        let store = localStore
+        let names = Set(store.entries.map { $0.name })
+        guard !names.isEmpty else { return [] }
+
+        // 粗筛：近 7 天（上传的就是最近进来的）
+        let options = PHFetchOptions()
+        options.predicate = NSPredicate(
+            format: "creationDate > %@",
+            NSDate(timeIntervalSinceNow: -7 * 86400))
+
+        let result = PHAsset.fetchAssets(with: .image, options: options)
+        guard result.count > 0 else { return [] }
+
+        var assets: [PHAsset] = []
+        result.enumerateObjects { asset, _, _ in
+            assets.append(asset)
         }
+
+        // 逐个拿资源文件名（公开 API，只读 photo 资源）
+        var fileNamesByAsset: [String: [String]] = [:]
+        for asset in assets {
+            for res in PHAssetResource.assetResources(for: asset) where res.type == .photo {
+                fileNamesByAsset[asset.localIdentifier, default: []]
+                    .append(res.originalFilename)
+            }
+        }
+
+        var photos: [SlidePhoto] = []
+        var seen = Set<String>()
+        for asset in assets {
+            let assetNames = fileNamesByAsset[asset.localIdentifier] ?? []
+            let matchedName = assetNames.first { names.contains($0) }
+            guard let matchedName, seen.insert(matchedName).inserted else {
+                continue
+            }
+            photos.append(SlidePhoto(id: asset.localIdentifier,
+                                     source: .asset(asset)))
+        }
+        return photos
     }
 
     // MARK: - 加载单张照片

@@ -19,6 +19,7 @@
 import Foundation
 import Combine
 import UIKit
+import Photos
 
 final class PhotoServer: ObservableObject {
 
@@ -140,6 +141,19 @@ final class PhotoServer: ObservableObject {
                 }
             }
 
+            // 媒体列表 = 登记表（大图在系统相册，本地只有登记）
+            func describeMedia() -> [[String: Any]] {
+                mainSync {
+                    store.entries.map { e in
+                        [
+                            "name": e.name,
+                            "size": e.bytes,
+                            "sizeText": LocalPhotoStore.formatBytes(e.bytes)
+                        ]
+                    }
+                }
+            }
+
             let music = (try? FileManager.default.contentsOfDirectory(
                 at: MusicStore.shared.musicDir,
                 includingPropertiesForKeys: [.isRegularFileKey],
@@ -151,7 +165,7 @@ final class PhotoServer: ObservableObject {
 
             return [
                 "inbox": describe(store.inbox),
-                "media": describe(store.media),
+                "media": describeMedia(),
                 "music": describe(music),
                 "autoImport": store.autoImport,
                 "received": receivedCount
@@ -183,10 +197,16 @@ final class PhotoServer: ObservableObject {
         // autoImport 在主线程读好再传进去
         let autoImport = mainSync { store.autoImport }
 
-        guard let saved = store.saveUpload(filename: name,
-                                           data: request.body,
-                                           importImmediately: autoImport) else {
-            return .json(["error": "格式不支持：\(name)"], status: 400)
+        let ok = store.saveUpload(filename: name,
+                                  data: request.body,
+                                  importImmediately: autoImport)
+        guard ok > 0 else {
+            return .json(["error": "存不进：\(name)"], status: 400)
+        }
+
+        // 写相册是异步的，稍后按文件名回填 assetID
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            self?.store.resolveAssetIDs()
         }
 
         publish {
@@ -196,7 +216,7 @@ final class PhotoServer: ObservableObject {
 
         return .json([
             "ok": true,
-            "name": saved.lastPathComponent,
+            "name": name,
             "imported": autoImport
         ], status: 201)
     }
@@ -204,14 +224,17 @@ final class PhotoServer: ObservableObject {
     private func handleImport(_ request: HTTPRequest) -> HTTPResponse {
         let payload = (try? JSONSerialization.jsonObject(with: request.body))
             as? [String: Any] ?? [:]
+        let names = payload["names"] as? [String] ?? []
 
         return mainSync {
-            if let names = payload["names"] as? [String], !names.isEmpty {
+            // 导入现在 = 把收件箱里的文件写进系统相册。
+            // 指定名字就只导那几张，没指定就全导。
+            if !names.isEmpty {
                 var moved = 0
                 for name in names {
-                    if let url = findPhoto(named: name), store.inbox.contains(url) {
-                        if store.importOne(url) != nil { moved += 1 }
-                    }
+                    let target = LocalPhotoStore.sanitize(name)
+                    let url = store.inbox.first { $0.lastPathComponent == target }
+                    if let url, store.importOne(url) > 0 { moved += 1 }
                 }
                 return .json(["imported": moved])
             }
@@ -225,9 +248,17 @@ final class PhotoServer: ObservableObject {
         let names = payload["names"] as? [String] ?? []
 
         return mainSync {
-            let targets = names.compactMap { findPhoto(named: $0) }
-            store.delete(targets)
-            return .json(["deleted": targets.count])
+            // 删的是「相框里的登记」（本地缩略图 + manifest），
+            // 系统相册里的原图不动 —— 那是用户的相册，不替用户删。
+            var deleted = 0
+            for name in names {
+                let target = LocalPhotoStore.sanitize(name)
+                if store.entries.contains(where: { $0.name == target }) {
+                    store.delete(named: target)
+                    deleted += 1
+                }
+            }
+            return .json(["deleted": deleted])
         }
     }
 
@@ -244,32 +275,76 @@ final class PhotoServer: ObservableObject {
     }
 
     private func serveThumbnail(name: String) -> HTTPResponse {
-        guard let url = findPhoto(named: name) else {
-            return .text(404, "找不到")
-        }
-        guard let thumb = store.makeThumbnail(for: url),
-              let data = try? Data(contentsOf: thumb) else {
-            return .text(404, "缩略图生成失败")
+        let target = LocalPhotoStore.sanitize(name)
+        // 缩略图：本地有就直接发；没有就 503，网页端显示占位块
+        let url = store.thumbnailURLForName(target)
+        guard let data = try? Data(contentsOf: url) else {
+            return .text(503, "缩略图还没生成，稍后再刷新")
         }
         return .data(data, type: "image/jpeg")
     }
 
+    /// 原图：大图在系统相册里，本地没有。
+    /// 按文件名从相册取数据发出去（iCloud 未下载的会先等它下载）。
     private func serveOriginal(name: String) -> HTTPResponse {
-        guard let url = findPhoto(named: name),
-              let data = try? Data(contentsOf: url) else {
-            return .text(404, "找不到")
+        let target = LocalPhotoStore.sanitize(name)
+
+        // 先查收件箱（还没进相册的）
+        if let inboxURL = store.inbox.first(where: { $0.lastPathComponent == target }),
+           let data = try? Data(contentsOf: inboxURL) {
+            return .data(data, type: mimeType(for: target))
         }
-        return .data(data, type: mimeType(for: url.pathExtension))
+
+        // 查相册
+        return mainSync {
+            guard let asset = self.albumAsset(named: target) else {
+                return .text(404, "找不到原图")
+            }
+
+            var imageData: Data?
+            let opts = PHImageRequestOptions()
+            opts.isNetworkAccessAllowed = true   // 等 iCloud 下载
+            PHImageManager.default().requestImageData(
+                for: asset,
+                options: opts
+            ) { data, _, _, _ in
+                DispatchQueue.main.async {
+                    imageData = data
+                }
+            }
+
+            // 最多等 60 秒（iCloud 大文件下载慢），到点没下完给提示
+            let deadline = Date().addingTimeInterval(60)
+            while imageData == nil && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+
+            guard let data = imageData else {
+                return .text(503, "原图还在 iCloud，稍后再试")
+            }
+            return .data(data, type: mimeType(for: target))
+        }
     }
 
-    /// 按文件名在两个目录里找。
-    /// 只比对 lastPathComponent，天然挡掉 ../ 之类的路径穿越。
-    private func findPhoto(named name: String) -> URL? {
-        mainSync {
-            let target = LocalPhotoStore.sanitize(name)
-            return store.media.first { $0.lastPathComponent == target }
-                ?? store.inbox.first { $0.lastPathComponent == target }
+    /// 按文件名到系统相册找 asset（只找登记表里有登记过的）。
+    /// KVC "filename" 谓词在 14.8 上对导入图查不出来，
+    /// 用「近 30 天粗筛 + 资源文件名精确核对」。
+    private func albumAsset(named name: String) -> PHAsset? {
+        guard store.entries.contains(where: { $0.name == name }) else { return nil }
+        let options = PHFetchOptions()
+        options.predicate = NSPredicate(
+            format: "creationDate > %@",
+            NSDate(timeIntervalSinceNow: -30 * 86400))
+        var found: PHAsset?
+        let result = PHAsset.fetchAssets(with: .image, options: options)
+        result.enumerateObjects { asset, _, _ in
+            for res in PHAssetResource.assetResources(for: asset) {
+                guard res.type == .photo, res.originalFilename == name
+                else { continue }
+                found = asset
+            }
         }
+        return found
     }
 
     private func mimeType(for ext: String) -> String {

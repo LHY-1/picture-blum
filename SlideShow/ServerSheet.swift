@@ -152,13 +152,15 @@ struct ServerSheet: View {
 
     private var librarySection: some View {
         Section(header: Text("已在相框里")) {
-            ServerStatRow(title: "照片数", value: "\(store.media.count) 张")
-            ServerStatRow(title: "占用空间",
+            ServerStatRow(title: "照片数", value: "\(store.entries.count) 张")
+            ServerStatRow(title: "原图大小",
                           value: LocalPhotoStore.formatBytes(store.mediaBytes))
+            ServerNoteRow(message: "原图存在系统相册里，本地只留小缩略图。",
+                          isError: false)
 
-            DangerButtonRow(title: "清空上传的照片",
+            DangerButtonRow(title: "清空上传的登记",
                             systemImage: "trash",
-                            enabled: !store.media.isEmpty,
+                            enabled: !store.entries.isEmpty,
                             action: clearMedia)
         }
     }
@@ -227,11 +229,11 @@ struct ServerSheet: View {
     }
 
     private func clearInbox() {
-        store.delete(store.inbox)
+        store.deleteInbox(store.inbox)
     }
 
     private func clearMedia() {
-        store.deleteAllMedia()
+        store.deleteAllEntries()
         viewModel.reloadLibrary()
     }
 
