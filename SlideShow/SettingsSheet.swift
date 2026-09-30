@@ -15,7 +15,7 @@ struct SettingsSheet: View {
 
     @ObservedObject private var server = PhotoServer.shared
     @ObservedObject private var store = LocalPhotoStore.shared
-    @StateObject private var checker = UpdateChecker()
+    @ObservedObject private var checker = UpdateChecker.shared
     @State private var showServer = false
 
     var body: some View {
@@ -380,6 +380,12 @@ struct SettingsSheet: View {
 
     private var updateSection: some View {
         Section(header: Text("更新")) {
+            // 自动热更新：检查 → 下载 → 校验 → TSServer 装 → 重启
+            Toggle("自动热更新", isOn: $checker.autoUpdate)
+            Text("有新版本时自动下载并安装（App 会退一次，起来就是新版；装不上会退回手动）。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
             // 状态行
             HStack {
                 Text("当前版本")
@@ -388,11 +394,32 @@ struct SettingsSheet: View {
                     .foregroundColor(.secondary)
             }
 
-            // 检查按钮：没检过 / 检到有新版 / 上次失败时显示
-            if checker.manifest == nil && checker.downloadedIPA == nil {
+            // 检到新版 → 手动装（自动装失败时的兜底入口）
+            if let m = checker.manifest, m.build > UpdateInfo.currentBuild {
+                HStack {
+                    Text("检测到 v\(m.version) (build \(m.build))")
+                        .font(.caption)
+                        .foregroundColor(.blue)
+                    Spacer()
+                }
+
+                if checker.downloadedIPA != nil {
+                    Button(action: { checker.retryInstall() }) {
+                        Label("重新安装 v\(m.version)", systemImage: "arrow.triangle.2.circlepath")
+                            .foregroundColor(.blue)
+                    }
+                    Button(action: { checker.openFilesApp() }) {
+                        Label("用「文件」App 手动装", systemImage: "folder")
+                            .foregroundColor(.orange)
+                    }
+                    Text("手动装：打开「文件」App → 本 App 文件夹 → 点 .ipa → 用 TrollStore 打开 → Install。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            } else if checker.checkError == nil {
                 Button(action: { checker.check() }) {
                     HStack {
-                        Label("检查更新", systemImage: "arrow.triangle.2.circlepath")
+                        Label("检查更新", systemImage: "magnifyingglass")
                             .foregroundColor(.blue)
                         Spacer()
                         if checker.isChecking {
@@ -400,27 +427,13 @@ struct SettingsSheet: View {
                         }
                     }
                 }
-                .disabled(checker.isChecking || checker.isDownloading)
+                .disabled(checker.isChecking || checker.isDownloading || checker.isInstalling)
             }
 
-            // 检到新版 → 下载 / 打开已下载的包
-            if let m = checker.manifest, m.build > UpdateInfo.currentBuild {
-                Button(action: { checker.download() }) {
-                    Label("下载新版本 v\(m.version) (build \(m.build))",
-                          systemImage: "arrow.down.circle")
-                        .foregroundColor(.blue)
-                }
-                .disabled(checker.isDownloading || checker.isChecking)
-
-                if let url = checker.downloadedIPA {
-                    Button(action: { checker.openFilesApp() }) {
-                        Label("在「文件」App 中安装", systemImage: "folder")
-                            .foregroundColor(.orange)
-                    }
-                    Text("装包：在「文件」App 里找到 SlideShow-\(m.version).ipa → 点它 → 用 TrollStore 打开 → Install。装完新 App 起来就能接着播。")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
+            if checker.isDownloading || checker.isInstalling {
+                Text(checker.isInstalling ? "正在安装新版，稍后自动重启…" : "正在下载…")
+                    .font(.caption)
+                    .foregroundColor(.blue)
             }
 
             if let err = checker.checkError {

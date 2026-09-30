@@ -21,6 +21,11 @@ struct SlideShowApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(viewModel)
+                .onAppear {
+                    // 每次起来：清掉上次的重启标记 + 跑一次自动更新流水线
+                    // （检查 → 下载 → 校验 → TSServer 安装 → 重启，全自动）
+                    UpdateChecker.shared.onAppLaunch()
+                }
                 .onChange(of: scenePhase) { phase in
                     // 没声明后台音频，切后台音乐会被系统停掉；
                     // 回前台把选中的歌重新放起来
