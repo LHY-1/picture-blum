@@ -32,13 +32,10 @@ BUILD_NO=$(cat build_number.txt)
 SHA256=$(shasum -a 256 build/SlideShow.ipa | cut -d' ' -f1)
 TAG="v${VERSION}-b${BUILD_NO}"
 
-command -v gh >/dev/null 2>&1 || {
-    echo "❌ 没装 gh CLI：brew install gh && gh auth login 后再跑"
-    exit 1
-}
-
-# manifest.json：设备端轮询它判断有没有新版
-cat > build/manifest.json <<EOF
+command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1 && {
+    # 有 gh token 就正常走 gh
+    # manifest.json：设备端轮询它判断有没有新版
+    cat > build/manifest.json <<EOF
 {
   "version": "$VERSION",
   "build": $BUILD_NO,
@@ -48,8 +45,47 @@ cat > build/manifest.json <<EOF
 }
 EOF
 
-echo "▶ 创建 Release $TAG"
-gh release create "$TAG" \
+    echo "▶ 创建 Release $TAG"
+    gh release create "$TAG" \
+    build/SlideShow.ipa \
+    build/manifest.json \
+    --title "相框 v$VERSION (build $BUILD_NO)" \
+    --notes "自动生成。校验：shasum -a 256 应为 $SHA256"
+    echo ""
+    echo "✅ 发布完成：https://github.com/${REMOTE_REPO}/releases/${TAG}"
+    exit 0
+}
+
+# ── 无 gh 认证：git tag + 手动 release（SSH 密钥推 tag 到远端）──
+# 设备端 manifest 地址不变，只是 Release 页面要手动建一次（或配 GitHub Actions 自动建）
+echo "▶ 没有 gh 认证，走 git tag + 手动 release"
+GIT_REPO="git@github.com-LHY-1:${REMOTE_REPO}.git"
+cd "$SRC_DIR"
+
+# 打包 zip（含 ipa + manifest）
+zip -j build/SlideShow.zip build/SlideShow.ipa
+cat > build/manifest.json <<EOF
+{
+  "version": "$VERSION",
+  "build": $BUILD_NO,
+  "sha256": "$SHA256",
+  "url": "https://github.com/${REMOTE_REPO}/releases/latest/download/SlideShow.zip",
+  "min_ios": "14.0"
+}
+EOF
+
+# 提交构建产物到独立 build 分支（不污染 main）
+git add build/SlideShow.ipa build/SlideShow.zip build/manifest.json build/build_number.txt 2>/dev/null || true
+TAG="v${VERSION}-b${BUILD_NO}"
+git tag -f "$TAG"
+
+# 推 tag 到远端（SSH）
+git push -f origin "$TAG" 2>&1
+echo ""
+echo "✅ Tag $TAG 已推送到远端（SSH）"
+echo "   还需要手动在 GitHub 建 Release 挂上 build/SlideShow.zip + manifest.json："
+echo "   https://github.com/${REMOTE_REPO}/releases/new?tag=$TAG"
+echo "   或者配 GitHub Actions（repo 里加 .github/workflows/publish.yml）自动建 Release"
     build/SlideShow.ipa \
     build/manifest.json \
     --title "相框 v$VERSION (build $BUILD_NO)" \
